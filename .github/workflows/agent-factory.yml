@@ -1,0 +1,76 @@
+name: Agent Factory
+on:
+  issues:
+    types:
+      - opened
+      - labeled
+permissions: {}
+concurrency:
+  group: agent-factory-launch
+  cancel-in-progress: false
+jobs:
+  agent:
+    if: ${{ vars.AGENT_FACTORY_ENABLED == 'true' && vars.AGENT_FACTORY_BUDGET_APPROVED == 'true' && github.repository == 'intelligent-iterations/ii-llm-lab' && github.run_number <= 100 && github.run_attempt <= 1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+      deployments: write
+      packages: read
+    steps:
+      - name: Read immutable runtime source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: intelligent-iterations/ii-open-agent-runtime-internal
+          ref: 5f09db47a1055210be688bd781f0dbeabee69d47
+          path: factory-runtime
+          persist-credentials: false
+          fetch-depth: 1
+          ssh-key: ${{ secrets.AGENT_FACTORY_RUNTIME_DEPLOY_KEY }}
+      - name: Pull private worker image
+        env:
+          FACTORY_WORKER_IMAGE: ghcr.io/intelligent-iterations/agent-factory-worker@sha256:56ed2cb10ac1965bb8e5137301ee5766de927b32ef40ac98693b9614da2d4380
+          FACTORY_REGISTRY_TOKEN: ${{ github.token }}
+        run: |-
+          printf %s "$FACTORY_REGISTRY_TOKEN" | docker login ghcr.io --username agent-factory --password-stdin
+          docker pull "$FACTORY_WORKER_IMAGE"
+          docker logout ghcr.io
+      - name: Use Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: Use OpenTofu
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with:
+          tofu_version: 1.12.6
+          tofu_wrapper: false
+      - name: Build trusted runtime
+        working-directory: factory-runtime
+        run: |-
+          npm ci --ignore-scripts
+          npm run build
+          npm --prefix example/agent-factory ci --ignore-scripts
+          npm --prefix example/agent-factory run build
+      - name: Authorize, reserve and execute
+        id: launch
+        working-directory: factory-runtime
+        env:
+          FACTORY_CONFIGURATION_DIGEST: sha256:842e1f4d8f212cc4b6fa1ad94e9bb8d241feb261309e2f738b9d0e41a9759648
+          FACTORY_TARGET_REPOSITORY: intelligent-iterations/ii-llm-lab
+          FACTORY_GITHUB_TOKEN: ${{ github.token }}
+          FACTORY_APP_PRIVATE_KEY: ${{ secrets.AGENT_FACTORY_GITHUB_PRIVATE_KEY_5131667 }}
+          FACTORY_CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FACTORY_ARTIFACT_PARENT: ${{ runner.temp }}/agent-factory-artifacts
+        run: node example/agent-factory/dist/actions-cli.js launch
+      - name: Retain bounded run evidence
+        if: ${{ always() && steps.launch.outputs.artifact_directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ format('agent-factory-{0}-{1}', github.run_id, github.run_attempt) }}
+          path: ${{ steps.launch.outputs.artifact_directory }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+          compression-level: 0
